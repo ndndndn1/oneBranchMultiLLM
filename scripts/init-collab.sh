@@ -12,8 +12,8 @@ NC='\033[0m'
 echo -e "${BLUE}"
 cat << 'EOF'
 ╔═══════════════════════════════════════════════════════════════╗
-║         Multi-Claude Collaboration System                     ║
-║              Initialization Script                            ║
+║      Multi-Claude Collaboration System (Code With Me)         ║
+║                   Initialization Script                       ║
 ╚═══════════════════════════════════════════════════════════════╝
 EOF
 echo -e "${NC}"
@@ -21,10 +21,14 @@ echo -e "${NC}"
 # 디렉토리 구조 생성
 echo -e "${YELLOW}Creating directory structure...${NC}"
 
-mkdir -p .claude-collab/{instances,locks,messages,tasks/{pending,in_progress,completed},conflicts,errors}
+mkdir -p .claude-collab/{instances,locks,messages,tasks/{pending,in_progress,completed},conflicts,errors,plans,edits,proposals,discussions}
 
 echo "  ✓ .claude-collab/instances/"
-echo "  ✓ .claude-collab/locks/"
+echo "  ✓ .claude-collab/plans/        (NEW: 계획 공유)"
+echo "  ✓ .claude-collab/edits/        (NEW: 수정 공유)"
+echo "  ✓ .claude-collab/proposals/    (NEW: 제안/투표)"
+echo "  ✓ .claude-collab/discussions/  (NEW: 토론)"
+echo "  ✓ .claude-collab/locks/        (레거시)"
 echo "  ✓ .claude-collab/messages/"
 echo "  ✓ .claude-collab/tasks/"
 echo "  ✓ .claude-collab/conflicts/"
@@ -94,9 +98,15 @@ echo "Next steps:"
 echo "  1. Register your Claude instance:"
 echo "     ./scripts/collab.sh register \"Your task description\""
 echo ""
-echo "  2. Check status:"
-echo "     ./scripts/collab.sh status"
+echo "  2. Check collaboration status:"
+echo "     ./scripts/collab.sh overview"
 echo ""
-echo "  3. Read CLAUDE.md for full protocol documentation"
+echo "  3. Share your plan before working:"
+echo "     ./scripts/collab.sh share-plan \"Feature title\" \"Description\" \"target files\""
 echo ""
-echo -e "${BLUE}Happy collaborating!${NC}"
+echo "  4. Share what you're editing:"
+echo "     ./scripts/collab.sh share-edit file.ts modify \"Adding feature\""
+echo ""
+echo "  5. Read CLAUDE.md for full protocol documentation"
+echo ""
+echo -e "${BLUE}Happy collaborating! 함께 생각하고, 계획을 공유하세요!${NC}"
