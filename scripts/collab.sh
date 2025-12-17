@@ -1,8 +1,16 @@
 #!/bin/bash
 # Multi-Claude Collaboration Script
 # 여러 Claude Code 인스턴스 간 협업을 위한 도구
+# Agent/MCP 친화적: --json 옵션으로 JSON 출력 지원
 
 set -e
+
+# JSON 모드 감지
+JSON_MODE=false
+if [ "$1" = "--json" ]; then
+    JSON_MODE=true
+    shift
+fi
 
 COLLAB_DIR=".claude-collab"
 INSTANCES_DIR="$COLLAB_DIR/instances"
@@ -21,18 +29,49 @@ PROPOSALS_DIR="$COLLAB_DIR/proposals"
 # 현재 Claude 인스턴스 ID (환경변수 또는 자동 생성)
 CLAUDE_ID="${CLAUDE_ID:-claude-$(hostname | md5sum | cut -c1-4)}"
 
-# 색상 정의
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# 색상 정의 (JSON 모드에서는 비활성화)
+if [ "$JSON_MODE" = true ]; then
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    NC=''
+else
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m'
+fi
 
 # 유틸리티 함수들
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_info() {
+    if [ "$JSON_MODE" = false ]; then
+        echo -e "${BLUE}[INFO]${NC} $1"
+    fi
+}
+log_success() {
+    if [ "$JSON_MODE" = false ]; then
+        echo -e "${GREEN}[SUCCESS]${NC} $1"
+    fi
+}
+log_warn() {
+    if [ "$JSON_MODE" = false ]; then
+        echo -e "${YELLOW}[WARN]${NC} $1"
+    fi
+}
+log_error() {
+    if [ "$JSON_MODE" = false ]; then
+        echo -e "${RED}[ERROR]${NC} $1"
+    fi
+}
+
+# JSON 출력 헬퍼
+json_output() {
+    if [ "$JSON_MODE" = true ]; then
+        echo "$1"
+    fi
+}
 
 timestamp() { date +%s; }
 datetime() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -1101,71 +1140,124 @@ cmd_resolve_discussion() {
 # ============================================
 
 cmd_overview() {
-    log_info "=== Collaboration Overview ==="
-    echo ""
-
-    # 활성 인스턴스 수
-    local active_count=0
     local current_time=$(timestamp)
+
+    # 활성 인스턴스 수집
+    local active_count=0
+    local instances_json="[]"
     for instance_file in "$INSTANCES_DIR"/*.json; do
         if [ -f "$instance_file" ]; then
             local last_hb=$(jq -r '.last_heartbeat' "$instance_file")
             local age=$((current_time - last_hb))
-            [ $age -lt 600 ] && active_count=$((active_count + 1))
+            if [ $age -lt 600 ]; then
+                active_count=$((active_count + 1))
+                local inst_data=$(jq --arg is_me "$([ "$(jq -r '.id' "$instance_file")" = "$CLAUDE_ID" ] && echo true || echo false)" \
+                    '. + {is_me: ($is_me == "true")}' "$instance_file")
+                instances_json=$(echo "$instances_json" | jq --argjson inst "$inst_data" '. += [$inst]')
+            fi
         fi
     done
 
-    # 진행 중인 계획 수
+    # 진행 중인 계획 수집
     local plans_in_progress=0
+    local plans_json="[]"
     for plan_file in "$PLANS_DIR"/*.json; do
         if [ -f "$plan_file" ]; then
             local status=$(jq -r '.status' "$plan_file")
-            [ "$status" = "in_progress" ] && plans_in_progress=$((plans_in_progress + 1))
+            if [ "$status" = "in_progress" ] || [ "$status" = "proposed" ]; then
+                [ "$status" = "in_progress" ] && plans_in_progress=$((plans_in_progress + 1))
+                plans_json=$(echo "$plans_json" | jq --slurpfile plan "$plan_file" '. += $plan')
+            fi
         fi
     done
 
-    # 활성 편집 수
+    # 활성 편집 수집
     local active_edits=0
+    local edits_json="[]"
     for edit_file in "$EDITS_DIR"/*.json; do
         if [ -f "$edit_file" ]; then
             local status=$(jq -r '.status' "$edit_file")
-            [ "$status" = "in_progress" ] && active_edits=$((active_edits + 1))
+            local ts=$(jq -r '.timestamp' "$edit_file")
+            local age=$((current_time - ts))
+            if [ "$status" = "in_progress" ] && [ $age -lt 1800 ]; then
+                active_edits=$((active_edits + 1))
+                edits_json=$(echo "$edits_json" | jq --slurpfile edit "$edit_file" '. += $edit')
+            fi
         fi
     done
 
-    # 열린 제안 수
+    # 열린 제안 수집
     local open_proposals=0
+    local proposals_json="[]"
     for proposal_file in "$PROPOSALS_DIR"/*.json; do
         if [ -f "$proposal_file" ]; then
             local status=$(jq -r '.status' "$proposal_file")
-            [ "$status" = "open" ] && open_proposals=$((open_proposals + 1))
+            if [ "$status" = "open" ]; then
+                open_proposals=$((open_proposals + 1))
+                proposals_json=$(echo "$proposals_json" | jq --slurpfile prop "$proposal_file" '. += $prop')
+            fi
         fi
     done
 
-    # 활성 토론 수
+    # 활성 토론 수집
     local active_discussions=0
+    local discussions_json="[]"
     for discussion_file in "$DISCUSSIONS_DIR"/*.json; do
         if [ -f "$discussion_file" ]; then
             local status=$(jq -r '.status' "$discussion_file")
-            [ "$status" = "active" ] && active_discussions=$((active_discussions + 1))
+            if [ "$status" = "active" ]; then
+                active_discussions=$((active_discussions + 1))
+                discussions_json=$(echo "$discussions_json" | jq --slurpfile disc "$discussion_file" '. += $disc')
+            fi
         fi
     done
 
+    # 읽지 않은 메시지 수집
+    local unread_count=0
+    local messages_json="[]"
+    for msg_file in "$MESSAGES_DIR/$CLAUDE_ID"/*.msg; do
+        if [ -f "$msg_file" ]; then
+            local read_status=$(jq -r '.read' "$msg_file")
+            if [ "$read_status" = "false" ]; then
+                unread_count=$((unread_count + 1))
+                messages_json=$(echo "$messages_json" | jq --slurpfile msg "$msg_file" '. += $msg')
+            fi
+        fi
+    done
+
+    # JSON 모드 출력
+    if [ "$JSON_MODE" = true ]; then
+        jq -n \
+            --arg my_id "$CLAUDE_ID" \
+            --argjson active_instances "$instances_json" \
+            --argjson active_plans "$plans_json" \
+            --argjson active_edits "$edits_json" \
+            --argjson open_proposals "$proposals_json" \
+            --argjson active_discussions "$discussions_json" \
+            --argjson unread_messages "$messages_json" \
+            --argjson counts "{\"instances\": $active_count, \"plans\": $plans_in_progress, \"edits\": $active_edits, \"proposals\": $open_proposals, \"discussions\": $active_discussions, \"unread\": $unread_count}" \
+            '{
+                my_id: $my_id,
+                counts: $counts,
+                active_instances: $active_instances,
+                active_plans: $active_plans,
+                active_edits: $active_edits,
+                open_proposals: $open_proposals,
+                active_discussions: $active_discussions,
+                unread_messages: $unread_messages
+            }'
+        return
+    fi
+
+    # 일반 텍스트 출력
+    log_info "=== Collaboration Overview ==="
+    echo ""
     echo "👥 Active Claudes: $active_count"
     echo "📋 Plans in progress: $plans_in_progress"
     echo "📝 Active edits: $active_edits"
     echo "💡 Open proposals: $open_proposals"
     echo "💬 Active discussions: $active_discussions"
     echo ""
-
-    # 읽지 않은 메시지 수
-    local unread_count=0
-    for msg_file in "$MESSAGES_DIR/$CLAUDE_ID"/*.msg; do
-        if [ -f "$msg_file" ]; then
-            local read_status=$(jq -r '.read' "$msg_file")
-            [ "$read_status" = "false" ] && unread_count=$((unread_count + 1))
-        fi
-    done
 
     if [ $unread_count -gt 0 ]; then
         echo "📬 You have $unread_count unread message(s)!"
