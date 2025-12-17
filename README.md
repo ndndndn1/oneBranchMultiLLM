@@ -18,7 +18,6 @@
 ./scripts/init-collab.sh
 
 # 2. Claude 인스턴스 등록
-export CLAUDE_ID="claude-1"
 ./scripts/collab.sh register "My task description"
 
 # 3. 협업 현황 확인
@@ -34,11 +33,49 @@ export CLAUDE_ID="claude-1"
 # 6. 작업 완료
 ./scripts/collab.sh finish-edit src/api/auth.ts
 ./scripts/collab.sh complete-plan <plan_id>
-
-# 7. 안전하게 커밋/푸시
-./scripts/conflict_resolver.sh safe-commit "feat: add feature"
-./scripts/conflict_resolver.sh safe-push
 ```
+
+## 🤖 자동 협업 (Agent-Friendly)
+
+### MCP 서버 사용 (권장)
+
+Claude Code가 자연스럽게 협업 도구를 사용할 수 있도록 MCP 서버를 제공합니다:
+
+```json
+{
+  "mcpServers": {
+    "collab": {
+      "command": "python3",
+      "args": ["mcp/collab-server.py"],
+      "cwd": "/path/to/oneBranchMultiLLM"
+    }
+  }
+}
+```
+
+MCP 도구:
+- `collab_register` - 세션 등록
+- `collab_overview` - 협업 현황 조회
+- `collab_share_plan` - 계획 공유
+- `collab_share_edit` - 수정 공유
+- `collab_propose` - 제안/질문
+- `collab_discuss` - 토론 시작
+
+### JSON 출력 모드
+
+Agent가 파싱하기 쉽도록 JSON 출력을 지원합니다:
+
+```bash
+./scripts/collab.sh --json overview
+./scripts/collab.sh --json view-plans
+./scripts/collab.sh --json view-edits
+```
+
+### Session Hooks
+
+세션 시작/종료 시 자동으로 협업 상태를 관리합니다:
+- `.claude/hooks/session-start.sh` - 세션 시작 시 자동 등록
+- `.claude/hooks/session-end.sh` - 세션 종료 시 자동 해제
 
 ## 핵심 기능
 
@@ -89,25 +126,6 @@ export CLAUDE_ID="claude-1"
 ./scripts/collab.sh resolve-discussion <id> "결론"
 ```
 
-### 5. 메시지 시스템
-
-Claude 인스턴스 간 직접 통신을 지원합니다.
-
-```bash
-./scripts/collab.sh send <claude_id> "message"
-./scripts/collab.sh broadcast "message to all"
-./scripts/collab.sh inbox
-```
-
-### 6. 레거시: 파일 잠금
-
-(권장하지 않음 - share-edit 사용 권장)
-
-```bash
-./scripts/collab.sh lock <file>
-./scripts/collab.sh unlock <file>
-```
-
 ## 아키텍처
 
 ```
@@ -127,24 +145,12 @@ Claude 인스턴스 간 직접 통신을 지원합니다.
                     ┌──────────▼──────────┐
                     │  .claude-collab/    │
                     │  ├── instances/     │ ← 활성 인스턴스
-                    │  ├── plans/         │ ← 계획 공유 (NEW)
-                    │  ├── edits/         │ ← 수정 공유 (NEW)
-                    │  ├── proposals/     │ ← 제안/투표 (NEW)
-                    │  ├── discussions/   │ ← 토론 (NEW)
-                    │  ├── locks/         │ ← 파일 잠금 (레거시)
-                    │  ├── messages/      │ ← 메시지 큐
-                    │  └── tasks/         │ ← 작업 상태
+                    │  ├── plans/         │ ← 계획 공유
+                    │  ├── edits/         │ ← 수정 공유
+                    │  ├── proposals/     │ ← 제안/투표
+                    │  ├── discussions/   │ ← 토론
+                    │  └── messages/      │ ← 메시지 큐
                     └─────────────────────┘
-```
-
-## 권장 워크플로우
-
-```
-1. 등록 → 2. 현황 파악 → 3. 계획 공유 → 4. 피드백 대기
-                                              ↓
-8. 종료 ← 7. 완료 알림 ← 6. 작업 ← 5. 수정 공유
-                           ↑
-                   막히면 제안/토론
 ```
 
 ## 디렉토리 구조
@@ -155,21 +161,22 @@ Claude 인스턴스 간 직접 통신을 지원합니다.
 ├── README.md                 # 이 파일
 ├── .gitignore
 ├── scripts/
-│   ├── collab.sh            # 핵심 협업 스크립트
+│   ├── collab.sh            # 핵심 협업 스크립트 (--json 지원)
 │   ├── collab_bridge.py     # WebSocket 브릿지 (선택)
 │   ├── conflict_resolver.sh # 충돌 해결 도구
 │   └── init-collab.sh       # 초기화 스크립트
+├── mcp/
+│   ├── collab-server.py     # MCP 서버 (Agent용)
+│   └── mcp-config.example.json
+├── .claude/
+│   ├── hooks/
+│   │   ├── session-start.sh # 세션 시작 hook
+│   │   └── session-end.sh   # 세션 종료 hook
+│   └── commands/
+│       └── collab.md        # 협업 명령어 가이드
 ├── docs/
-│   └── WORKFLOW_EXAMPLES.md # 상세 워크플로우 예시
+│   └── WORKFLOW_EXAMPLES.md
 └── .claude-collab/          # 런타임 데이터 (git ignored)
-    ├── instances/
-    ├── plans/               # NEW
-    ├── edits/               # NEW
-    ├── proposals/           # NEW
-    ├── discussions/         # NEW
-    ├── locks/
-    ├── messages/
-    └── tasks/
 ```
 
 ## 요구사항
@@ -177,7 +184,8 @@ Claude 인스턴스 간 직접 통신을 지원합니다.
 - Bash
 - jq (JSON 처리)
 - Git
-- Python 3.x (브릿지 서버 사용 시)
+- Python 3.x (MCP 서버 사용 시)
+- mcp SDK (MCP 서버 사용 시): `pip install mcp`
 
 ## 협업 철학
 

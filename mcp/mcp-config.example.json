@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "collab": {
+      "command": "python3",
+      "args": ["mcp/collab-server.py"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "CLAUDE_ID": "claude-${random}"
+      }
+    }
+  }
+}
