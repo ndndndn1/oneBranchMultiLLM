@@ -37,6 +37,7 @@ EDITS_DIR = COLLAB_DIR / "edits"
 PROPOSALS_DIR = COLLAB_DIR / "proposals"
 DISCUSSIONS_DIR = COLLAB_DIR / "discussions"
 MESSAGES_DIR = COLLAB_DIR / "messages"
+CONFLICTS_DIR = COLLAB_DIR / "conflicts"
 
 def get_claude_id() -> str:
     """Generate or get Claude instance ID"""
@@ -51,7 +52,7 @@ def get_claude_id() -> str:
 
 def ensure_dirs():
     """Ensure all collaboration directories exist"""
-    for d in [INSTANCES_DIR, PLANS_DIR, EDITS_DIR, PROPOSALS_DIR, DISCUSSIONS_DIR, MESSAGES_DIR]:
+    for d in [INSTANCES_DIR, PLANS_DIR, EDITS_DIR, PROPOSALS_DIR, DISCUSSIONS_DIR, MESSAGES_DIR, CONFLICTS_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 def timestamp() -> int:
@@ -523,6 +524,182 @@ class CollabServer:
                 f.write_text(json.dumps(data, indent=2))
         return {"messages": messages}
 
+    # ========== Collaborative Conflict Resolution ==========
+
+    def report_conflict(self, file_path: str, description: str = "", other_editor: str = "") -> dict:
+        """Report a file conflict and start resolution discussion"""
+        encoded = encode_path(file_path)
+
+        # Auto-detect other editor if not provided
+        if not other_editor:
+            for f in EDITS_DIR.glob(f"{encoded}_*.json"):
+                data = json.loads(f.read_text())
+                if data.get("editor") != self.claude_id and data.get("status") == "in_progress":
+                    other_editor = data["editor"]
+                    break
+
+        conflict_id = f"{timestamp()}_{encoded}"
+        conflict_file = CONFLICTS_DIR / f"{conflict_id}.json"
+
+        participants = [self.claude_id]
+        if other_editor:
+            participants.append(other_editor)
+
+        data = {
+            "id": conflict_id,
+            "file": file_path,
+            "reporter": self.claude_id,
+            "other_party": other_editor or None,
+            "description": description or "Concurrent edit conflict",
+            "reported_at": datetime_str(),
+            "status": "open",
+            "resolutions": [],
+            "participants": participants,
+            "discussion_messages": [{
+                "author": self.claude_id,
+                "text": f"충돌 보고: {description or f'{file_path} 파일에서 동시 수정 충돌이 발생했습니다.'}",
+                "timestamp": datetime_str()
+            }],
+            "selected_resolution": None
+        }
+        conflict_file.write_text(json.dumps(data, indent=2))
+
+        # Notify other party
+        if other_editor:
+            self._send_message(other_editor, f"[CONFLICT] 🔴 {self.claude_id} reported a conflict on {file_path}", "urgent")
+        self._broadcast(f"[CONFLICT] 🔴 Conflict on {file_path} by {self.claude_id}", "urgent")
+
+        return {"success": True, "conflict_id": conflict_id, "other_editor": other_editor}
+
+    def view_conflicts(self) -> dict:
+        """View all conflicts"""
+        conflicts = []
+        current_time = timestamp()
+        for f in CONFLICTS_DIR.glob("*.json"):
+            data = json.loads(f.read_text())
+            conflicts.append({
+                **data,
+                "resolution_count": len(data.get("resolutions", [])),
+                "is_participant": self.claude_id in data.get("participants", [])
+            })
+        return {"conflicts": sorted(conflicts, key=lambda x: x.get("reported_at", ""), reverse=True)}
+
+    def get_conflict_detail(self, conflict_id: str) -> dict:
+        """Get detailed conflict information"""
+        conflict_file = CONFLICTS_DIR / f"{conflict_id}.json"
+        if not conflict_file.exists():
+            return {"success": False, "error": "Conflict not found"}
+        return {"success": True, "conflict": json.loads(conflict_file.read_text())}
+
+    def add_conflict_message(self, conflict_id: str, message: str) -> dict:
+        """Add a message to conflict discussion"""
+        conflict_file = CONFLICTS_DIR / f"{conflict_id}.json"
+        if not conflict_file.exists():
+            return {"success": False, "error": "Conflict not found"}
+
+        data = json.loads(conflict_file.read_text())
+        data["discussion_messages"].append({
+            "author": self.claude_id,
+            "text": message,
+            "timestamp": datetime_str()
+        })
+        if self.claude_id not in data["participants"]:
+            data["participants"].append(self.claude_id)
+        data["status"] = "discussing"
+        conflict_file.write_text(json.dumps(data, indent=2))
+
+        # Notify participants
+        for p in data["participants"]:
+            if p != self.claude_id:
+                self._send_message(p, f"[CONFLICT] {self.claude_id}: {message}")
+
+        return {"success": True}
+
+    def propose_resolution(self, conflict_id: str, strategy: str, description: str = "") -> dict:
+        """Propose a resolution strategy for a conflict
+
+        Strategies:
+        - split-regions: Divide file into separate work regions
+        - sequential: Work sequentially (one completes, then other)
+        - merge: Work together, manually merge later
+        - delegate: Delegate entire work to one Claude
+        - other: Custom strategy
+        """
+        conflict_file = CONFLICTS_DIR / f"{conflict_id}.json"
+        if not conflict_file.exists():
+            return {"success": False, "error": "Conflict not found"}
+
+        data = json.loads(conflict_file.read_text())
+        resolution_id = f"{self.claude_id}_{timestamp()}"
+
+        data["resolutions"].append({
+            "id": resolution_id,
+            "proposer": self.claude_id,
+            "strategy": strategy,
+            "description": description or "No additional description",
+            "proposed_at": datetime_str(),
+            "votes": {"agree": [], "disagree": []}
+        })
+        data["status"] = "voting"
+        conflict_file.write_text(json.dumps(data, indent=2))
+
+        # Notify participants
+        for p in data["participants"]:
+            if p != self.claude_id:
+                self._send_message(p, f"[RESOLUTION] 🗳️ {self.claude_id} proposed '{strategy}' - Please vote!")
+
+        return {"success": True, "resolution_id": resolution_id}
+
+    def vote_resolution(self, conflict_id: str, resolution_id: str, vote: str) -> dict:
+        """Vote on a proposed resolution (agree/disagree)"""
+        conflict_file = CONFLICTS_DIR / f"{conflict_id}.json"
+        if not conflict_file.exists():
+            return {"success": False, "error": "Conflict not found"}
+
+        data = json.loads(conflict_file.read_text())
+        vote_key = "agree" if vote == "agree" else "disagree"
+
+        for res in data["resolutions"]:
+            if res["id"] == resolution_id:
+                if self.claude_id not in res["votes"][vote_key]:
+                    res["votes"][vote_key].append(self.claude_id)
+                # Notify proposer
+                if res["proposer"] != self.claude_id:
+                    self._send_message(res["proposer"], f"[VOTE] {self.claude_id} voted '{vote}' on your resolution")
+                break
+
+        conflict_file.write_text(json.dumps(data, indent=2))
+        return {"success": True}
+
+    def resolve_conflict(self, conflict_id: str, resolution_id: str = "", final_notes: str = "") -> dict:
+        """Mark a conflict as resolved"""
+        conflict_file = CONFLICTS_DIR / f"{conflict_id}.json"
+        if not conflict_file.exists():
+            return {"success": False, "error": "Conflict not found"}
+
+        data = json.loads(conflict_file.read_text())
+
+        # Auto-select resolution with most agree votes if not specified
+        if not resolution_id and data["resolutions"]:
+            best = max(data["resolutions"], key=lambda r: len(r["votes"]["agree"]))
+            resolution_id = best["id"]
+
+        data["status"] = "resolved"
+        data["selected_resolution"] = resolution_id
+        data["resolved_at"] = datetime_str()
+        data["resolved_by"] = self.claude_id
+        data["final_notes"] = final_notes or "Conflict resolved"
+        conflict_file.write_text(json.dumps(data, indent=2))
+
+        strategy = ""
+        for res in data["resolutions"]:
+            if res["id"] == resolution_id:
+                strategy = res["strategy"]
+                break
+
+        self._broadcast(f"[RESOLVED] ✅ {data['file']} conflict resolved by {self.claude_id}{f' using {strategy}' if strategy else ''}")
+        return {"success": True, "strategy": strategy}
+
 
 # ========== MCP Server Setup ==========
 
@@ -682,6 +859,85 @@ if HAS_MCP:
                 description="Unregister from collaboration. Call this at session end.",
                 inputSchema={"type": "object", "properties": {}}
             ),
+            # Conflict Resolution Tools
+            Tool(
+                name="collab_report_conflict",
+                description="Report a file conflict when multiple Claudes are editing the same file. Starts a resolution discussion.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "The conflicting file path"},
+                        "description": {"type": "string", "description": "Description of the conflict"},
+                        "other_editor": {"type": "string", "description": "ID of the other Claude (auto-detected if not provided)"}
+                    },
+                    "required": ["file_path"]
+                }
+            ),
+            Tool(
+                name="collab_view_conflicts",
+                description="View all active and resolved conflicts",
+                inputSchema={"type": "object", "properties": {}}
+            ),
+            Tool(
+                name="collab_conflict_detail",
+                description="Get detailed information about a specific conflict",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"conflict_id": {"type": "string"}},
+                    "required": ["conflict_id"]
+                }
+            ),
+            Tool(
+                name="collab_conflict_message",
+                description="Add a message to a conflict discussion",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "conflict_id": {"type": "string"},
+                        "message": {"type": "string"}
+                    },
+                    "required": ["conflict_id", "message"]
+                }
+            ),
+            Tool(
+                name="collab_propose_resolution",
+                description="Propose a resolution strategy for a conflict. Strategies: split-regions, sequential, merge, delegate, other",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "conflict_id": {"type": "string"},
+                        "strategy": {"type": "string", "enum": ["split-regions", "sequential", "merge", "delegate", "other"]},
+                        "description": {"type": "string", "description": "Additional details about the resolution"}
+                    },
+                    "required": ["conflict_id", "strategy"]
+                }
+            ),
+            Tool(
+                name="collab_vote_resolution",
+                description="Vote agree or disagree on a proposed conflict resolution",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "conflict_id": {"type": "string"},
+                        "resolution_id": {"type": "string"},
+                        "vote": {"type": "string", "enum": ["agree", "disagree"]}
+                    },
+                    "required": ["conflict_id", "resolution_id", "vote"]
+                }
+            ),
+            Tool(
+                name="collab_resolve_conflict",
+                description="Mark a conflict as resolved. If resolution_id not provided, selects the one with most agree votes.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "conflict_id": {"type": "string"},
+                        "resolution_id": {"type": "string", "description": "ID of the selected resolution (optional)"},
+                        "final_notes": {"type": "string", "description": "Final notes about the resolution"}
+                    },
+                    "required": ["conflict_id"]
+                }
+            ),
         ]
 
     @server.call_tool()
@@ -737,6 +993,40 @@ if HAS_MCP:
                 result = collab.send_message(arguments["target"], arguments["message"])
             elif name == "collab_unregister":
                 result = collab.unregister()
+            # Conflict Resolution
+            elif name == "collab_report_conflict":
+                result = collab.report_conflict(
+                    arguments["file_path"],
+                    arguments.get("description", ""),
+                    arguments.get("other_editor", "")
+                )
+            elif name == "collab_view_conflicts":
+                result = collab.view_conflicts()
+            elif name == "collab_conflict_detail":
+                result = collab.get_conflict_detail(arguments["conflict_id"])
+            elif name == "collab_conflict_message":
+                result = collab.add_conflict_message(
+                    arguments["conflict_id"],
+                    arguments["message"]
+                )
+            elif name == "collab_propose_resolution":
+                result = collab.propose_resolution(
+                    arguments["conflict_id"],
+                    arguments["strategy"],
+                    arguments.get("description", "")
+                )
+            elif name == "collab_vote_resolution":
+                result = collab.vote_resolution(
+                    arguments["conflict_id"],
+                    arguments["resolution_id"],
+                    arguments["vote"]
+                )
+            elif name == "collab_resolve_conflict":
+                result = collab.resolve_conflict(
+                    arguments["conflict_id"],
+                    arguments.get("resolution_id", ""),
+                    arguments.get("final_notes", "")
+                )
             else:
                 result = {"error": f"Unknown tool: {name}"}
 
