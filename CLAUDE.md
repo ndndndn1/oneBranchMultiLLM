@@ -72,6 +72,11 @@ MCP 도구 목록:
 - `collab_propose` - 제안/질문
 - `collab_discuss` - 토론 시작
 - `collab_inbox` - 메시지 확인
+- `collab_report_conflict` - 충돌 보고
+- `collab_view_conflicts` - 충돌 목록 조회
+- `collab_propose_resolution` - 해결 방안 제안
+- `collab_vote_resolution` - 해결 방안 투표
+- `collab_resolve_conflict` - 충돌 해결 완료
 
 ---
 
@@ -164,6 +169,13 @@ MCP 도구 목록:
 ./scripts/collab.sh discuss "주제" "메시지"
 ./scripts/collab.sh reply <id> "답변"
 
+# 충돌 해결
+./scripts/collab.sh report-conflict <file> "설명"
+./scripts/collab.sh view-conflicts
+./scripts/collab.sh propose-resolution <id> <strategy> "설명"
+./scripts/collab.sh vote-resolution <id> <res_id> agree
+./scripts/collab.sh resolve-conflict <id>
+
 # 메시지
 ./scripts/collab.sh inbox
 ./scripts/collab.sh send <claude_id> "메시지"
@@ -212,19 +224,90 @@ MCP 도구 목록:
 
 ---
 
-## 🚨 충돌 해결 전략
+## 🚨 협의적 충돌 해결 (Collaborative Conflict Resolution)
 
 ### 같은 파일 수정 시
 `share-edit` 사용 시 같은 파일을 수정 중인 Claude가 있으면 **자동 경고**가 발송됩니다.
 
-1. 경고 수신 시 `inbox` 확인
-2. 해당 Claude와 `discuss` 또는 `send`로 조율
-3. 작업 영역 분리 또는 순차 작업 결정
+### 충돌 해결 워크플로우 (MANDATORY)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 충돌 감지                                                     │
+│    share-edit 시 경고 → report-conflict                          │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. 충돌 협의                                                     │
+│    conflict-message로 토론 → propose-resolution로 해결책 제안    │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. 투표 및 합의                                                  │
+│    vote-resolution agree/disagree → 합의 도출                    │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. 충돌 해결                                                     │
+│    resolve-conflict → 합의된 전략에 따라 작업 진행                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 충돌 해결 명령어
+
+```bash
+# 충돌 보고 (자동으로 상대방 감지)
+./scripts/collab.sh report-conflict <file> "설명"
+
+# 현재 충돌 목록 조회
+./scripts/collab.sh view-conflicts
+
+# 충돌 상세 정보 조회
+./scripts/collab.sh conflict-detail <conflict_id>
+
+# 충돌 토론에 메시지 추가
+./scripts/collab.sh conflict-message <conflict_id> "메시지"
+
+# 해결 방안 제안
+./scripts/collab.sh propose-resolution <conflict_id> <strategy> "설명"
+
+# 해결 방안 투표
+./scripts/collab.sh vote-resolution <conflict_id> <resolution_id> agree
+
+# 충돌 해결 완료
+./scripts/collab.sh resolve-conflict <conflict_id>
+```
+
+### 해결 전략 (Resolution Strategies)
+
+| 전략 | 설명 | 사용 상황 |
+|------|------|----------|
+| `split-regions` | 파일 내 작업 영역 분리 | 다른 함수/섹션을 담당할 때 |
+| `sequential` | 순차 작업 | 한 Claude가 먼저 완료 후 다른 Claude 작업 |
+| `merge` | 공동 작업 후 병합 | 변경 범위가 명확히 구분될 때 |
+| `delegate` | 작업 위임 | 한 Claude에게 전체 작업 위임 |
+| `other` | 기타 전략 | 커스텀 해결 방안 |
+
+### MCP 충돌 해결 도구
+
+```
+collab_report_conflict    - 충돌 보고
+collab_view_conflicts     - 충돌 목록 조회
+collab_conflict_detail    - 충돌 상세 정보
+collab_conflict_message   - 충돌 토론 메시지 추가
+collab_propose_resolution - 해결 방안 제안
+collab_vote_resolution    - 해결 방안 투표
+collab_resolve_conflict   - 충돌 해결 완료
+```
 
 ### Git 충돌 발생 시
 1. 작업 중단하고 `broadcast`로 알림
-2. `discuss`로 해결 방법 논의
-3. 충돌 해결 후 `complete` 알림
+2. `report-conflict`로 충돌 보고
+3. `propose-resolution`으로 해결 방안 제안
+4. 합의 후 충돌 해결
 
 ---
 

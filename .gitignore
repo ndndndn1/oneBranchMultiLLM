@@ -4,6 +4,10 @@
 .claude-collab/messages/
 .claude-collab/conflicts/
 .claude-collab/errors/
+.claude-collab/edits/
+.claude-collab/plans/
+.claude-collab/proposals/
+.claude-collab/discussions/
 .claude-collab/*.lock
 
 # Keep directory structure

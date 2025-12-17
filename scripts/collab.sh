@@ -804,17 +804,28 @@ EOF
     log_info "Other Claudes can see you're editing this file"
 
     # 같은 파일을 수정 중인 다른 Claude가 있는지 확인
+    local has_conflict=false
+    local conflict_editors=""
     for other_edit in "$EDITS_DIR"/${encoded}_*.json; do
         if [ -f "$other_edit" ] && [ "$other_edit" != "$edit_file" ]; then
             local other_editor=$(jq -r '.editor' "$other_edit")
             local other_status=$(jq -r '.status' "$other_edit")
             if [ "$other_status" = "in_progress" ]; then
+                has_conflict=true
+                conflict_editors="$conflict_editors $other_editor"
                 log_warn "⚠️  $other_editor is also editing $file_path!"
-                log_info "Consider coordinating to avoid conflicts"
                 cmd_send "$other_editor" "[CONCURRENT EDIT] $CLAUDE_ID is also editing $file_path - let's coordinate!" "urgent"
             fi
         fi
     done
+
+    if [ "$has_conflict" = true ]; then
+        log_warn "🔴 POTENTIAL CONFLICT DETECTED!"
+        log_info "To start conflict resolution discussion, run:"
+        log_info "  ./scripts/collab.sh report-conflict \"$file_path\" \"설명\""
+        log_info ""
+        log_info "Or coordinate directly with:$conflict_editors"
+    fi
 }
 
 cmd_view_edits() {
@@ -1136,6 +1147,327 @@ cmd_resolve_discussion() {
 }
 
 # ============================================
+# 협의적 충돌 해결 (Collaborative Conflict Resolution)
+# ============================================
+
+cmd_report_conflict() {
+    local file_path="$1"
+    local description="$2"
+    local other_editor="$3"  # 충돌 상대방 (optional, auto-detect if empty)
+
+    if [ -z "$file_path" ]; then
+        log_error "Usage: collab.sh report-conflict <file_path> [description] [other_editor]"
+        exit 1
+    fi
+
+    local encoded=$(encode_path "$file_path")
+
+    # 충돌 상대방 자동 감지
+    if [ -z "$other_editor" ]; then
+        for other_edit in "$EDITS_DIR"/${encoded}_*.json; do
+            if [ -f "$other_edit" ]; then
+                local editor=$(jq -r '.editor' "$other_edit")
+                local status=$(jq -r '.status' "$other_edit")
+                if [ "$editor" != "$CLAUDE_ID" ] && [ "$status" = "in_progress" ]; then
+                    other_editor="$editor"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    if [ -z "$other_editor" ]; then
+        log_warn "No other editor detected for $file_path"
+        log_info "If you know who you're conflicting with, use: collab.sh report-conflict <file> <desc> <other_claude_id>"
+    fi
+
+    # 충돌 ID 생성
+    local conflict_id="$(timestamp)_${encoded}"
+    local conflict_file="$CONFLICTS_DIR/${conflict_id}.json"
+
+    cat > "$conflict_file" << EOF
+{
+    "id": "$conflict_id",
+    "file": "$file_path",
+    "reporter": "$CLAUDE_ID",
+    "other_party": "$other_editor",
+    "description": "${description:-Concurrent edit conflict}",
+    "reported_at": "$(datetime)",
+    "status": "open",
+    "resolutions": [],
+    "participants": ["$CLAUDE_ID"${other_editor:+, \"$other_editor\"}],
+    "discussion_messages": [
+        {
+            "author": "$CLAUDE_ID",
+            "text": "충돌 보고: ${description:-$file_path 파일에서 동시 수정 충돌이 발생했습니다. 함께 해결 방안을 논의해주세요.}",
+            "timestamp": "$(datetime)"
+        }
+    ],
+    "selected_resolution": null
+}
+EOF
+
+    log_success "Conflict reported: $file_path (ID: $conflict_id)"
+    log_info "Other Claudes can now propose resolutions"
+
+    # 관련자들에게 알림
+    if [ -n "$other_editor" ]; then
+        cmd_send "$other_editor" "[CONFLICT] 🔴 $CLAUDE_ID reported a conflict on $file_path - Please discuss resolution!" "urgent"
+    fi
+    cmd_broadcast "[CONFLICT] 🔴 Conflict reported on $file_path by $CLAUDE_ID - Discussion needed!" "urgent"
+
+    echo "$conflict_id"
+}
+
+cmd_view_conflicts() {
+    log_info "=== Active Conflicts ==="
+    echo ""
+
+    local found=0
+    for conflict_file in "$CONFLICTS_DIR"/*.json; do
+        if [ -f "$conflict_file" ]; then
+            local id=$(jq -r '.id' "$conflict_file")
+            local file=$(jq -r '.file' "$conflict_file")
+            local reporter=$(jq -r '.reporter' "$conflict_file")
+            local other_party=$(jq -r '.other_party' "$conflict_file")
+            local description=$(jq -r '.description' "$conflict_file")
+            local status=$(jq -r '.status' "$conflict_file")
+            local reported_at=$(jq -r '.reported_at' "$conflict_file")
+            local resolution_count=$(jq '.resolutions | length' "$conflict_file")
+            local selected=$(jq -r '.selected_resolution' "$conflict_file")
+
+            local status_icon="🔴"
+            [ "$status" = "discussing" ] && status_icon="💬"
+            [ "$status" = "voting" ] && status_icon="🗳️"
+            [ "$status" = "resolved" ] && status_icon="✅"
+
+            echo "$status_icon [$status] $file"
+            echo "   Reporter: $reporter"
+            [ "$other_party" != "null" ] && [ -n "$other_party" ] && echo "   Other party: $other_party"
+            echo "   Description: $description"
+            echo "   Reported: $reported_at"
+            echo "   Proposed resolutions: $resolution_count"
+            [ "$selected" != "null" ] && echo "   Selected resolution: $selected"
+            echo "   Conflict ID: $id"
+            echo ""
+            found=$((found + 1))
+        fi
+    done
+
+    if [ $found -eq 0 ]; then
+        echo "  No active conflicts"
+    fi
+}
+
+cmd_propose_resolution() {
+    local conflict_id="$1"
+    local strategy="$2"  # split-regions, sequential, merge, delegate, other
+    local description="$3"
+
+    if [ -z "$conflict_id" ] || [ -z "$strategy" ]; then
+        log_error "Usage: collab.sh propose-resolution <conflict_id> <strategy> [description]"
+        log_info "Strategies:"
+        log_info "  split-regions  - 파일 내 작업 영역 분리 (예: 다른 함수/섹션 담당)"
+        log_info "  sequential     - 순차 작업 (한 Claude가 먼저 완료 후 다른 Claude 작업)"
+        log_info "  merge          - 공동 작업 후 수동 병합"
+        log_info "  delegate       - 한 Claude에게 전체 작업 위임"
+        log_info "  other          - 기타 (description에 상세 기술)"
+        exit 1
+    fi
+
+    local conflict_file="$CONFLICTS_DIR/${conflict_id}.json"
+    if [ ! -f "$conflict_file" ]; then
+        log_error "Conflict not found: $conflict_id"
+        exit 1
+    fi
+
+    local resolution_id="${CLAUDE_ID}_$(timestamp)"
+    local tmp=$(mktemp)
+
+    local new_resolution=$(cat << EOF
+{
+    "id": "$resolution_id",
+    "proposer": "$CLAUDE_ID",
+    "strategy": "$strategy",
+    "description": "${description:-No additional description}",
+    "proposed_at": "$(datetime)",
+    "votes": {"agree": [], "disagree": []}
+}
+EOF
+)
+
+    jq --argjson resolution "$new_resolution" \
+        '.resolutions += [$resolution] | .status = "voting"' \
+        "$conflict_file" > "$tmp"
+    mv "$tmp" "$conflict_file"
+
+    log_success "Resolution proposed: $strategy (ID: $resolution_id)"
+
+    # 참여자들에게 알림
+    local participants=$(jq -r '.participants[]' "$conflict_file")
+    local file=$(jq -r '.file' "$conflict_file")
+    for participant in $participants; do
+        if [ "$participant" != "$CLAUDE_ID" ]; then
+            cmd_send "$participant" "[RESOLUTION] 🗳️ $CLAUDE_ID proposed '$strategy' for $file conflict - Please vote!" "normal"
+        fi
+    done
+
+    cmd_broadcast "[RESOLUTION] 🗳️ $CLAUDE_ID proposed '$strategy' resolution for conflict on $file" "system"
+}
+
+cmd_vote_resolution() {
+    local conflict_id="$1"
+    local resolution_id="$2"
+    local vote="$3"  # agree or disagree
+
+    if [ -z "$conflict_id" ] || [ -z "$resolution_id" ] || [ -z "$vote" ]; then
+        log_error "Usage: collab.sh vote-resolution <conflict_id> <resolution_id> <agree|disagree>"
+        exit 1
+    fi
+
+    local conflict_file="$CONFLICTS_DIR/${conflict_id}.json"
+    if [ ! -f "$conflict_file" ]; then
+        log_error "Conflict not found: $conflict_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+    if [ "$vote" = "agree" ]; then
+        jq --arg rid "$resolution_id" --arg voter "$CLAUDE_ID" \
+            '(.resolutions[] | select(.id == $rid) | .votes.agree) += [$voter] | (.resolutions[] | select(.id == $rid) | .votes.agree) |= unique' \
+            "$conflict_file" > "$tmp"
+    else
+        jq --arg rid "$resolution_id" --arg voter "$CLAUDE_ID" \
+            '(.resolutions[] | select(.id == $rid) | .votes.disagree) += [$voter] | (.resolutions[] | select(.id == $rid) | .votes.disagree) |= unique' \
+            "$conflict_file" > "$tmp"
+    fi
+    mv "$tmp" "$conflict_file"
+
+    log_success "Vote recorded: $vote for resolution $resolution_id"
+
+    # 제안자에게 알림
+    local proposer=$(jq -r --arg rid "$resolution_id" '.resolutions[] | select(.id == $rid) | .proposer' "$conflict_file")
+    if [ -n "$proposer" ] && [ "$proposer" != "$CLAUDE_ID" ]; then
+        cmd_send "$proposer" "[VOTE] $CLAUDE_ID voted '$vote' on your resolution proposal" "normal"
+    fi
+}
+
+cmd_add_conflict_message() {
+    local conflict_id="$1"
+    local message="$2"
+
+    if [ -z "$conflict_id" ] || [ -z "$message" ]; then
+        log_error "Usage: collab.sh conflict-message <conflict_id> <message>"
+        exit 1
+    fi
+
+    local conflict_file="$CONFLICTS_DIR/${conflict_id}.json"
+    if [ ! -f "$conflict_file" ]; then
+        log_error "Conflict not found: $conflict_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+    local new_message="{\"author\": \"$CLAUDE_ID\", \"text\": \"$message\", \"timestamp\": \"$(datetime)\"}"
+    jq --argjson msg "$new_message" --arg participant "$CLAUDE_ID" \
+        '.discussion_messages += [$msg] | .participants += [$participant] | .participants = (.participants | unique) | .status = "discussing"' \
+        "$conflict_file" > "$tmp"
+    mv "$tmp" "$conflict_file"
+
+    log_success "Message added to conflict discussion"
+
+    # 다른 참여자들에게 알림
+    local participants=$(jq -r '.participants[]' "$conflict_file")
+    local file=$(jq -r '.file' "$conflict_file")
+    for participant in $participants; do
+        if [ "$participant" != "$CLAUDE_ID" ]; then
+            cmd_send "$participant" "[CONFLICT DISCUSSION] $CLAUDE_ID on $file: $message" "normal"
+        fi
+    done
+}
+
+cmd_resolve_conflict() {
+    local conflict_id="$1"
+    local resolution_id="$2"
+    local final_notes="$3"
+
+    if [ -z "$conflict_id" ]; then
+        log_error "Usage: collab.sh resolve-conflict <conflict_id> [resolution_id] [final_notes]"
+        exit 1
+    fi
+
+    local conflict_file="$CONFLICTS_DIR/${conflict_id}.json"
+    if [ ! -f "$conflict_file" ]; then
+        log_error "Conflict not found: $conflict_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+
+    # resolution_id가 제공되지 않으면 가장 많은 agree 투표를 받은 것 선택
+    if [ -z "$resolution_id" ]; then
+        resolution_id=$(jq -r '.resolutions | sort_by(.votes.agree | length) | reverse | .[0].id // empty' "$conflict_file")
+    fi
+
+    jq --arg rid "$resolution_id" --arg notes "${final_notes:-Conflict resolved}" \
+        '.status = "resolved" | .selected_resolution = $rid | .resolved_at = "'"$(datetime)"'" | .resolved_by = "'"$CLAUDE_ID"'" | .final_notes = $notes' \
+        "$conflict_file" > "$tmp"
+    mv "$tmp" "$conflict_file"
+
+    local file=$(jq -r '.file' "$conflict_file")
+    local strategy=""
+    if [ -n "$resolution_id" ]; then
+        strategy=$(jq -r --arg rid "$resolution_id" '.resolutions[] | select(.id == $rid) | .strategy' "$conflict_file")
+    fi
+
+    log_success "Conflict resolved: $file"
+    [ -n "$strategy" ] && log_info "Applied strategy: $strategy"
+
+    cmd_broadcast "[CONFLICT RESOLVED] ✅ $file conflict resolved by $CLAUDE_ID${strategy:+ using '$strategy' strategy}" "system"
+}
+
+cmd_view_conflict_detail() {
+    local conflict_id="$1"
+
+    if [ -z "$conflict_id" ]; then
+        log_error "Usage: collab.sh conflict-detail <conflict_id>"
+        exit 1
+    fi
+
+    local conflict_file="$CONFLICTS_DIR/${conflict_id}.json"
+    if [ ! -f "$conflict_file" ]; then
+        log_error "Conflict not found: $conflict_id"
+        exit 1
+    fi
+
+    log_info "=== Conflict Detail ==="
+    echo ""
+
+    local file=$(jq -r '.file' "$conflict_file")
+    local status=$(jq -r '.status' "$conflict_file")
+    local reporter=$(jq -r '.reporter' "$conflict_file")
+    local description=$(jq -r '.description' "$conflict_file")
+
+    echo "📁 File: $file"
+    echo "📊 Status: $status"
+    echo "👤 Reporter: $reporter"
+    echo "📝 Description: $description"
+    echo ""
+
+    log_info "=== Discussion Messages ==="
+    jq -r '.discussion_messages[] | "[\(.timestamp)] \(.author): \(.text)"' "$conflict_file"
+    echo ""
+
+    log_info "=== Proposed Resolutions ==="
+    local resolutions=$(jq -r '.resolutions[] | "[\(.strategy)] by \(.proposer) - 👍 \(.votes.agree | length) / 👎 \(.votes.disagree | length)\n   ID: \(.id)\n   \(.description)"' "$conflict_file")
+    if [ -n "$resolutions" ]; then
+        echo "$resolutions"
+    else
+        echo "  No resolutions proposed yet"
+    fi
+}
+
+# ============================================
 # 협업 요약 (Collaboration Summary)
 # ============================================
 
@@ -1308,6 +1640,22 @@ Instance Management:
   reply <id> <message>                Reply to a discussion
   resolve-discussion <id> [resolution] Resolve a discussion
 
+=== CONFLICT RESOLUTION (협의적 충돌 해결) ===
+  report-conflict <file> [desc] [other_id]  Report a file conflict
+  view-conflicts                            View all conflicts
+  conflict-detail <id>                      View conflict details
+  conflict-message <id> <message>           Add message to conflict discussion
+  propose-resolution <id> <strategy> [desc] Propose a resolution strategy
+  vote-resolution <id> <res_id> agree|disagree  Vote on resolution
+  resolve-conflict <id> [res_id] [notes]    Mark conflict as resolved
+
+  Resolution Strategies:
+    split-regions  - Divide file into separate work regions
+    sequential     - Work sequentially (one completes, then other)
+    merge          - Work together, manually merge later
+    delegate       - Delegate entire work to one Claude
+    other          - Custom strategy (describe in description)
+
 === LEGACY FILE LOCKING (레거시 파일 잠금) ===
   lock <file>          Acquire lock on a file
   unlock <file>        Release lock on a file
@@ -1401,6 +1749,15 @@ case "${1:-help}" in
     view-discussions) cmd_view_discussions ;;
     reply)          cmd_reply "$2" "$3" ;;
     resolve-discussion) cmd_resolve_discussion "$2" "$3" ;;
+
+    # Conflict resolution (충돌 해결)
+    report-conflict)    cmd_report_conflict "$2" "$3" "$4" ;;
+    view-conflicts)     cmd_view_conflicts ;;
+    conflict-detail)    cmd_view_conflict_detail "$2" ;;
+    conflict-message)   cmd_add_conflict_message "$2" "$3" ;;
+    propose-resolution) cmd_propose_resolution "$2" "$3" "$4" ;;
+    vote-resolution)    cmd_vote_resolution "$2" "$3" "$4" ;;
+    resolve-conflict)   cmd_resolve_conflict "$2" "$3" "$4" ;;
 
     # Legacy file locking (레거시)
     lock)           cmd_lock "$2" ;;

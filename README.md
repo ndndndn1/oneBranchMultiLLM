@@ -60,6 +60,10 @@ MCP 도구:
 - `collab_share_edit` - 수정 공유
 - `collab_propose` - 제안/질문
 - `collab_discuss` - 토론 시작
+- `collab_report_conflict` - 충돌 보고
+- `collab_propose_resolution` - 해결 방안 제안
+- `collab_vote_resolution` - 해결 방안 투표
+- `collab_resolve_conflict` - 충돌 해결 완료
 
 ### JSON 출력 모드
 
@@ -103,6 +107,33 @@ Agent가 파싱하기 쉽도록 JSON 출력을 지원합니다:
 ```
 
 **같은 파일을 수정 중인 Claude가 있으면 자동 경고!**
+
+### 2.5. 협의적 충돌 해결 (Collaborative Conflict Resolution)
+
+같은 파일을 수정할 때 발생하는 충돌을 협의하여 해결합니다.
+
+```bash
+# 충돌 보고 (자동으로 상대방 감지)
+./scripts/collab.sh report-conflict <file> "설명"
+
+# 충돌 목록 및 상세 조회
+./scripts/collab.sh view-conflicts
+./scripts/collab.sh conflict-detail <conflict_id>
+
+# 해결 방안 제안 및 투표
+./scripts/collab.sh propose-resolution <conflict_id> <strategy> "설명"
+./scripts/collab.sh vote-resolution <conflict_id> <resolution_id> agree
+
+# 충돌 해결 완료
+./scripts/collab.sh resolve-conflict <conflict_id>
+```
+
+**해결 전략:**
+- `split-regions` - 파일 내 작업 영역 분리
+- `sequential` - 순차 작업 (한 Claude가 먼저 완료)
+- `merge` - 공동 작업 후 수동 병합
+- `delegate` - 한 Claude에게 전체 작업 위임
+- `other` - 커스텀 전략
 
 ### 3. 협업적 사고 (Collaborative Thinking)
 
