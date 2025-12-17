@@ -12,6 +12,12 @@ TASKS_DIR="$COLLAB_DIR/tasks"
 CONFLICTS_DIR="$COLLAB_DIR/conflicts"
 ERRORS_DIR="$COLLAB_DIR/errors"
 
+# 새로운 협업 디렉토리 (Code With Me 스타일)
+PLANS_DIR="$COLLAB_DIR/plans"
+EDITS_DIR="$COLLAB_DIR/edits"
+DISCUSSIONS_DIR="$COLLAB_DIR/discussions"
+PROPOSALS_DIR="$COLLAB_DIR/proposals"
+
 # 현재 Claude 인스턴스 ID (환경변수 또는 자동 생성)
 CLAUDE_ID="${CLAUDE_ID:-claude-$(hostname | md5sum | cut -c1-4)}"
 
@@ -43,6 +49,8 @@ decode_path() {
 # 디렉토리 초기화
 init_dirs() {
     mkdir -p "$INSTANCES_DIR" "$LOCKS_DIR" "$MESSAGES_DIR" "$TASKS_DIR"/{pending,in_progress,completed} "$CONFLICTS_DIR" "$ERRORS_DIR"
+    # 협업 기반 디렉토리
+    mkdir -p "$PLANS_DIR" "$EDITS_DIR" "$DISCUSSIONS_DIR" "$PROPOSALS_DIR"
 }
 
 # ============================================
@@ -559,12 +567,618 @@ EOF
 }
 
 # ============================================
+# 계획 공유 시스템 (Code With Me 스타일)
+# ============================================
+
+cmd_share_plan() {
+    local title="$1"
+    local description="$2"
+    local target_files="$3"
+
+    if [ -z "$title" ]; then
+        log_error "Usage: collab.sh share-plan <title> [description] [target_files]"
+        exit 1
+    fi
+
+    local plan_id="$(timestamp)_${CLAUDE_ID}"
+    local plan_file="$PLANS_DIR/${plan_id}.json"
+
+    cat > "$plan_file" << EOF
+{
+    "id": "$plan_id",
+    "author": "$CLAUDE_ID",
+    "title": "$title",
+    "description": "$description",
+    "target_files": "$target_files",
+    "status": "proposed",
+    "created_at": "$(datetime)",
+    "comments": [],
+    "approvals": [],
+    "implementation_started": false
+}
+EOF
+
+    cmd_broadcast "[PLAN] $CLAUDE_ID shared a plan: $title" "system"
+    log_success "Plan shared: $title (ID: $plan_id)"
+    log_info "Other Claudes can now review and comment on this plan"
+}
+
+cmd_view_plans() {
+    log_info "=== Shared Plans ==="
+    echo ""
+
+    for plan_file in "$PLANS_DIR"/*.json; do
+        if [ -f "$plan_file" ]; then
+            local id=$(jq -r '.id' "$plan_file")
+            local author=$(jq -r '.author' "$plan_file")
+            local title=$(jq -r '.title' "$plan_file")
+            local description=$(jq -r '.description' "$plan_file")
+            local target_files=$(jq -r '.target_files' "$plan_file")
+            local status=$(jq -r '.status' "$plan_file")
+            local created=$(jq -r '.created_at' "$plan_file")
+            local approval_count=$(jq '.approvals | length' "$plan_file")
+            local comment_count=$(jq '.comments | length' "$plan_file")
+
+            local status_icon="📋"
+            [ "$status" = "approved" ] && status_icon="✅"
+            [ "$status" = "in_progress" ] && status_icon="🔨"
+            [ "$status" = "completed" ] && status_icon="🎉"
+            [ "$status" = "rejected" ] && status_icon="❌"
+
+            echo "$status_icon [$status] $title"
+            echo "   Author: $author | Created: $created"
+            [ -n "$description" ] && [ "$description" != "null" ] && echo "   Description: $description"
+            [ -n "$target_files" ] && [ "$target_files" != "null" ] && echo "   Target files: $target_files"
+            echo "   Comments: $comment_count | Approvals: $approval_count"
+            echo "   Plan ID: $id"
+            echo ""
+        fi
+    done
+}
+
+cmd_comment_plan() {
+    local plan_id="$1"
+    local comment="$2"
+
+    if [ -z "$plan_id" ] || [ -z "$comment" ]; then
+        log_error "Usage: collab.sh comment-plan <plan_id> <comment>"
+        exit 1
+    fi
+
+    local plan_file="$PLANS_DIR/${plan_id}.json"
+    if [ ! -f "$plan_file" ]; then
+        log_error "Plan not found: $plan_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+    local new_comment="{\"author\": \"$CLAUDE_ID\", \"text\": \"$comment\", \"timestamp\": \"$(datetime)\"}"
+    jq --argjson comment "$new_comment" '.comments += [$comment]' "$plan_file" > "$tmp"
+    mv "$tmp" "$plan_file"
+
+    local author=$(jq -r '.author' "$plan_file")
+    cmd_send "$author" "[COMMENT] $CLAUDE_ID commented on your plan: $comment" "normal"
+    log_success "Comment added to plan"
+}
+
+cmd_approve_plan() {
+    local plan_id="$1"
+
+    if [ -z "$plan_id" ]; then
+        log_error "Usage: collab.sh approve-plan <plan_id>"
+        exit 1
+    fi
+
+    local plan_file="$PLANS_DIR/${plan_id}.json"
+    if [ ! -f "$plan_file" ]; then
+        log_error "Plan not found: $plan_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+    jq --arg approver "$CLAUDE_ID" '.approvals += [$approver] | .approvals = (.approvals | unique)' "$plan_file" > "$tmp"
+    mv "$tmp" "$plan_file"
+
+    local author=$(jq -r '.author' "$plan_file")
+    local title=$(jq -r '.title' "$plan_file")
+    cmd_send "$author" "[APPROVED] $CLAUDE_ID approved your plan: $title" "normal"
+    log_success "Plan approved"
+}
+
+cmd_start_plan() {
+    local plan_id="$1"
+
+    if [ -z "$plan_id" ]; then
+        log_error "Usage: collab.sh start-plan <plan_id>"
+        exit 1
+    fi
+
+    local plan_file="$PLANS_DIR/${plan_id}.json"
+    if [ ! -f "$plan_file" ]; then
+        log_error "Plan not found: $plan_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+    jq '.status = "in_progress" | .implementation_started = true | .started_at = "'"$(datetime)"'"' "$plan_file" > "$tmp"
+    mv "$tmp" "$plan_file"
+
+    local title=$(jq -r '.title' "$plan_file")
+    cmd_broadcast "[IMPLEMENTATION] $CLAUDE_ID started implementing: $title" "system"
+    log_success "Plan implementation started"
+}
+
+cmd_complete_plan() {
+    local plan_id="$1"
+
+    if [ -z "$plan_id" ]; then
+        log_error "Usage: collab.sh complete-plan <plan_id>"
+        exit 1
+    fi
+
+    local plan_file="$PLANS_DIR/${plan_id}.json"
+    if [ ! -f "$plan_file" ]; then
+        log_error "Plan not found: $plan_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+    jq '.status = "completed" | .completed_at = "'"$(datetime)"'"' "$plan_file" > "$tmp"
+    mv "$tmp" "$plan_file"
+
+    local title=$(jq -r '.title' "$plan_file")
+    cmd_broadcast "[COMPLETED] $CLAUDE_ID completed plan: $title" "system"
+    log_success "Plan marked as completed"
+}
+
+# ============================================
+# 실시간 수정 공유 (Live Editing)
+# ============================================
+
+cmd_share_edit() {
+    local file_path="$1"
+    local change_type="$2"  # add, modify, delete, refactor
+    local description="$3"
+
+    if [ -z "$file_path" ] || [ -z "$description" ]; then
+        log_error "Usage: collab.sh share-edit <file_path> <change_type> <description>"
+        log_info "Change types: add, modify, delete, refactor"
+        exit 1
+    fi
+
+    local encoded=$(encode_path "$file_path")
+    local edit_file="$EDITS_DIR/${encoded}_${CLAUDE_ID}.json"
+
+    cat > "$edit_file" << EOF
+{
+    "file": "$file_path",
+    "editor": "$CLAUDE_ID",
+    "change_type": "${change_type:-modify}",
+    "description": "$description",
+    "started_at": "$(datetime)",
+    "timestamp": $(timestamp),
+    "status": "in_progress"
+}
+EOF
+
+    log_success "Edit shared: $file_path"
+    log_info "Other Claudes can see you're editing this file"
+
+    # 같은 파일을 수정 중인 다른 Claude가 있는지 확인
+    for other_edit in "$EDITS_DIR"/${encoded}_*.json; do
+        if [ -f "$other_edit" ] && [ "$other_edit" != "$edit_file" ]; then
+            local other_editor=$(jq -r '.editor' "$other_edit")
+            local other_status=$(jq -r '.status' "$other_edit")
+            if [ "$other_status" = "in_progress" ]; then
+                log_warn "⚠️  $other_editor is also editing $file_path!"
+                log_info "Consider coordinating to avoid conflicts"
+                cmd_send "$other_editor" "[CONCURRENT EDIT] $CLAUDE_ID is also editing $file_path - let's coordinate!" "urgent"
+            fi
+        fi
+    done
+}
+
+cmd_view_edits() {
+    log_info "=== Active Edits ==="
+    echo ""
+
+    local current_time=$(timestamp)
+
+    for edit_file in "$EDITS_DIR"/*.json; do
+        if [ -f "$edit_file" ]; then
+            local file=$(jq -r '.file' "$edit_file")
+            local editor=$(jq -r '.editor' "$edit_file")
+            local change_type=$(jq -r '.change_type' "$edit_file")
+            local description=$(jq -r '.description' "$edit_file")
+            local started=$(jq -r '.started_at' "$edit_file")
+            local ts=$(jq -r '.timestamp' "$edit_file")
+            local status=$(jq -r '.status' "$edit_file")
+            local age=$((current_time - ts))
+
+            # 30분 이상 된 편집은 비활성으로 표시
+            if [ $age -gt 1800 ]; then
+                status="stale"
+            fi
+
+            local type_icon="📝"
+            [ "$change_type" = "add" ] && type_icon="➕"
+            [ "$change_type" = "delete" ] && type_icon="➖"
+            [ "$change_type" = "refactor" ] && type_icon="🔄"
+
+            local status_icon="🔨"
+            [ "$status" = "completed" ] && status_icon="✅"
+            [ "$status" = "stale" ] && status_icon="⏸️"
+
+            if [ "$editor" = "$CLAUDE_ID" ]; then
+                echo -e "${GREEN}$status_icon $type_icon $file (YOU)${NC}"
+            else
+                echo "$status_icon $type_icon $file"
+            fi
+            echo "   Editor: $editor | Type: $change_type"
+            echo "   Description: $description"
+            echo "   Started: $started (${age}s ago)"
+            echo ""
+        fi
+    done
+}
+
+cmd_finish_edit() {
+    local file_path="$1"
+
+    if [ -z "$file_path" ]; then
+        log_error "Usage: collab.sh finish-edit <file_path>"
+        exit 1
+    fi
+
+    local encoded=$(encode_path "$file_path")
+    local edit_file="$EDITS_DIR/${encoded}_${CLAUDE_ID}.json"
+
+    if [ -f "$edit_file" ]; then
+        local tmp=$(mktemp)
+        jq '.status = "completed" | .finished_at = "'"$(datetime)"'"' "$edit_file" > "$tmp"
+        mv "$tmp" "$edit_file"
+        log_success "Edit finished: $file_path"
+    else
+        log_warn "No active edit found for $file_path"
+    fi
+}
+
+# ============================================
+# 협업적 사고 (Collaborative Thinking)
+# ============================================
+
+cmd_propose() {
+    local proposal_type="$1"  # approach, alternative, optimization, question
+    local title="$2"
+    local details="$3"
+
+    if [ -z "$proposal_type" ] || [ -z "$title" ]; then
+        log_error "Usage: collab.sh propose <type> <title> [details]"
+        log_info "Types: approach, alternative, optimization, question"
+        exit 1
+    fi
+
+    local proposal_id="$(timestamp)_${CLAUDE_ID}"
+    local proposal_file="$PROPOSALS_DIR/${proposal_id}.json"
+
+    cat > "$proposal_file" << EOF
+{
+    "id": "$proposal_id",
+    "type": "$proposal_type",
+    "author": "$CLAUDE_ID",
+    "title": "$title",
+    "details": "$details",
+    "created_at": "$(datetime)",
+    "votes": {"agree": [], "disagree": []},
+    "responses": [],
+    "status": "open"
+}
+EOF
+
+    local type_icon="💡"
+    [ "$proposal_type" = "alternative" ] && type_icon="🔀"
+    [ "$proposal_type" = "optimization" ] && type_icon="⚡"
+    [ "$proposal_type" = "question" ] && type_icon="❓"
+
+    cmd_broadcast "[PROPOSAL] $type_icon $CLAUDE_ID proposes: $title" "normal"
+    log_success "Proposal submitted: $title (ID: $proposal_id)"
+    log_info "Other Claudes can vote agree/disagree or respond"
+}
+
+cmd_view_proposals() {
+    log_info "=== Active Proposals ==="
+    echo ""
+
+    for proposal_file in "$PROPOSALS_DIR"/*.json; do
+        if [ -f "$proposal_file" ]; then
+            local id=$(jq -r '.id' "$proposal_file")
+            local ptype=$(jq -r '.type' "$proposal_file")
+            local author=$(jq -r '.author' "$proposal_file")
+            local title=$(jq -r '.title' "$proposal_file")
+            local details=$(jq -r '.details' "$proposal_file")
+            local created=$(jq -r '.created_at' "$proposal_file")
+            local status=$(jq -r '.status' "$proposal_file")
+            local agrees=$(jq '.votes.agree | length' "$proposal_file")
+            local disagrees=$(jq '.votes.disagree | length' "$proposal_file")
+            local response_count=$(jq '.responses | length' "$proposal_file")
+
+            local type_icon="💡"
+            [ "$ptype" = "alternative" ] && type_icon="🔀"
+            [ "$ptype" = "optimization" ] && type_icon="⚡"
+            [ "$ptype" = "question" ] && type_icon="❓"
+
+            echo "$type_icon [$ptype] $title"
+            echo "   Author: $author | Status: $status"
+            [ -n "$details" ] && [ "$details" != "null" ] && echo "   Details: $details"
+            echo "   Votes: 👍 $agrees | 👎 $disagrees | Responses: $response_count"
+            echo "   Proposal ID: $id"
+            echo ""
+        fi
+    done
+}
+
+cmd_vote() {
+    local proposal_id="$1"
+    local vote="$2"  # agree or disagree
+
+    if [ -z "$proposal_id" ] || [ -z "$vote" ]; then
+        log_error "Usage: collab.sh vote <proposal_id> <agree|disagree>"
+        exit 1
+    fi
+
+    local proposal_file="$PROPOSALS_DIR/${proposal_id}.json"
+    if [ ! -f "$proposal_file" ]; then
+        log_error "Proposal not found: $proposal_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+    if [ "$vote" = "agree" ]; then
+        jq --arg voter "$CLAUDE_ID" '.votes.agree += [$voter] | .votes.agree = (.votes.agree | unique)' "$proposal_file" > "$tmp"
+    else
+        jq --arg voter "$CLAUDE_ID" '.votes.disagree += [$voter] | .votes.disagree = (.votes.disagree | unique)' "$proposal_file" > "$tmp"
+    fi
+    mv "$tmp" "$proposal_file"
+
+    local author=$(jq -r '.author' "$proposal_file")
+    local title=$(jq -r '.title' "$proposal_file")
+    cmd_send "$author" "[VOTE] $CLAUDE_ID voted $vote on: $title" "normal"
+    log_success "Vote recorded: $vote"
+}
+
+cmd_respond() {
+    local proposal_id="$1"
+    local response="$2"
+
+    if [ -z "$proposal_id" ] || [ -z "$response" ]; then
+        log_error "Usage: collab.sh respond <proposal_id> <response>"
+        exit 1
+    fi
+
+    local proposal_file="$PROPOSALS_DIR/${proposal_id}.json"
+    if [ ! -f "$proposal_file" ]; then
+        log_error "Proposal not found: $proposal_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+    local new_response="{\"author\": \"$CLAUDE_ID\", \"text\": \"$response\", \"timestamp\": \"$(datetime)\"}"
+    jq --argjson response "$new_response" '.responses += [$response]' "$proposal_file" > "$tmp"
+    mv "$tmp" "$proposal_file"
+
+    local author=$(jq -r '.author' "$proposal_file")
+    cmd_send "$author" "[RESPONSE] $CLAUDE_ID responded to your proposal: $response" "normal"
+    log_success "Response added"
+}
+
+# ============================================
+# 토론 시스템 (Discussion Threads)
+# ============================================
+
+cmd_discuss() {
+    local topic="$1"
+    local initial_message="$2"
+
+    if [ -z "$topic" ]; then
+        log_error "Usage: collab.sh discuss <topic> [initial_message]"
+        exit 1
+    fi
+
+    local discussion_id="$(timestamp)_${CLAUDE_ID}"
+    local discussion_file="$DISCUSSIONS_DIR/${discussion_id}.json"
+
+    cat > "$discussion_file" << EOF
+{
+    "id": "$discussion_id",
+    "topic": "$topic",
+    "initiator": "$CLAUDE_ID",
+    "created_at": "$(datetime)",
+    "messages": [
+        {
+            "author": "$CLAUDE_ID",
+            "text": "${initial_message:-Let's discuss: $topic}",
+            "timestamp": "$(datetime)"
+        }
+    ],
+    "participants": ["$CLAUDE_ID"],
+    "status": "active"
+}
+EOF
+
+    cmd_broadcast "[DISCUSSION] 💬 $CLAUDE_ID started a discussion: $topic" "normal"
+    log_success "Discussion started: $topic (ID: $discussion_id)"
+}
+
+cmd_view_discussions() {
+    log_info "=== Active Discussions ==="
+    echo ""
+
+    for discussion_file in "$DISCUSSIONS_DIR"/*.json; do
+        if [ -f "$discussion_file" ]; then
+            local id=$(jq -r '.id' "$discussion_file")
+            local topic=$(jq -r '.topic' "$discussion_file")
+            local initiator=$(jq -r '.initiator' "$discussion_file")
+            local created=$(jq -r '.created_at' "$discussion_file")
+            local status=$(jq -r '.status' "$discussion_file")
+            local msg_count=$(jq '.messages | length' "$discussion_file")
+            local participants=$(jq -r '.participants | join(", ")' "$discussion_file")
+
+            local status_icon="💬"
+            [ "$status" = "resolved" ] && status_icon="✅"
+            [ "$status" = "closed" ] && status_icon="🔒"
+
+            echo "$status_icon $topic"
+            echo "   Started by: $initiator | Messages: $msg_count"
+            echo "   Participants: $participants"
+            echo "   Discussion ID: $id"
+            echo ""
+        fi
+    done
+}
+
+cmd_reply() {
+    local discussion_id="$1"
+    local message="$2"
+
+    if [ -z "$discussion_id" ] || [ -z "$message" ]; then
+        log_error "Usage: collab.sh reply <discussion_id> <message>"
+        exit 1
+    fi
+
+    local discussion_file="$DISCUSSIONS_DIR/${discussion_id}.json"
+    if [ ! -f "$discussion_file" ]; then
+        log_error "Discussion not found: $discussion_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+    local new_message="{\"author\": \"$CLAUDE_ID\", \"text\": \"$message\", \"timestamp\": \"$(datetime)\"}"
+    jq --argjson msg "$new_message" --arg participant "$CLAUDE_ID" \
+        '.messages += [$msg] | .participants += [$participant] | .participants = (.participants | unique)' \
+        "$discussion_file" > "$tmp"
+    mv "$tmp" "$discussion_file"
+
+    # 다른 참여자들에게 알림
+    local participants=$(jq -r '.participants[]' "$discussion_file")
+    local topic=$(jq -r '.topic' "$discussion_file")
+    for participant in $participants; do
+        if [ "$participant" != "$CLAUDE_ID" ]; then
+            cmd_send "$participant" "[REPLY] $CLAUDE_ID in '$topic': $message" "normal"
+        fi
+    done
+
+    log_success "Reply added to discussion"
+}
+
+cmd_resolve_discussion() {
+    local discussion_id="$1"
+    local resolution="$2"
+
+    if [ -z "$discussion_id" ]; then
+        log_error "Usage: collab.sh resolve-discussion <discussion_id> [resolution]"
+        exit 1
+    fi
+
+    local discussion_file="$DISCUSSIONS_DIR/${discussion_id}.json"
+    if [ ! -f "$discussion_file" ]; then
+        log_error "Discussion not found: $discussion_id"
+        exit 1
+    fi
+
+    local tmp=$(mktemp)
+    jq --arg resolution "${resolution:-Resolved}" \
+        '.status = "resolved" | .resolution = $resolution | .resolved_at = "'"$(datetime)"'" | .resolved_by = "'"$CLAUDE_ID"'"' \
+        "$discussion_file" > "$tmp"
+    mv "$tmp" "$discussion_file"
+
+    local topic=$(jq -r '.topic' "$discussion_file")
+    cmd_broadcast "[RESOLVED] Discussion '$topic' resolved by $CLAUDE_ID: ${resolution:-Resolved}" "system"
+    log_success "Discussion resolved"
+}
+
+# ============================================
+# 협업 요약 (Collaboration Summary)
+# ============================================
+
+cmd_overview() {
+    log_info "=== Collaboration Overview ==="
+    echo ""
+
+    # 활성 인스턴스 수
+    local active_count=0
+    local current_time=$(timestamp)
+    for instance_file in "$INSTANCES_DIR"/*.json; do
+        if [ -f "$instance_file" ]; then
+            local last_hb=$(jq -r '.last_heartbeat' "$instance_file")
+            local age=$((current_time - last_hb))
+            [ $age -lt 600 ] && active_count=$((active_count + 1))
+        fi
+    done
+
+    # 진행 중인 계획 수
+    local plans_in_progress=0
+    for plan_file in "$PLANS_DIR"/*.json; do
+        if [ -f "$plan_file" ]; then
+            local status=$(jq -r '.status' "$plan_file")
+            [ "$status" = "in_progress" ] && plans_in_progress=$((plans_in_progress + 1))
+        fi
+    done
+
+    # 활성 편집 수
+    local active_edits=0
+    for edit_file in "$EDITS_DIR"/*.json; do
+        if [ -f "$edit_file" ]; then
+            local status=$(jq -r '.status' "$edit_file")
+            [ "$status" = "in_progress" ] && active_edits=$((active_edits + 1))
+        fi
+    done
+
+    # 열린 제안 수
+    local open_proposals=0
+    for proposal_file in "$PROPOSALS_DIR"/*.json; do
+        if [ -f "$proposal_file" ]; then
+            local status=$(jq -r '.status' "$proposal_file")
+            [ "$status" = "open" ] && open_proposals=$((open_proposals + 1))
+        fi
+    done
+
+    # 활성 토론 수
+    local active_discussions=0
+    for discussion_file in "$DISCUSSIONS_DIR"/*.json; do
+        if [ -f "$discussion_file" ]; then
+            local status=$(jq -r '.status' "$discussion_file")
+            [ "$status" = "active" ] && active_discussions=$((active_discussions + 1))
+        fi
+    done
+
+    echo "👥 Active Claudes: $active_count"
+    echo "📋 Plans in progress: $plans_in_progress"
+    echo "📝 Active edits: $active_edits"
+    echo "💡 Open proposals: $open_proposals"
+    echo "💬 Active discussions: $active_discussions"
+    echo ""
+
+    # 읽지 않은 메시지 수
+    local unread_count=0
+    for msg_file in "$MESSAGES_DIR/$CLAUDE_ID"/*.msg; do
+        if [ -f "$msg_file" ]; then
+            local read_status=$(jq -r '.read' "$msg_file")
+            [ "$read_status" = "false" ] && unread_count=$((unread_count + 1))
+        fi
+    done
+
+    if [ $unread_count -gt 0 ]; then
+        echo "📬 You have $unread_count unread message(s)!"
+    fi
+}
+
+# ============================================
 # 도움말
 # ============================================
 
 cmd_help() {
     cat << 'EOF'
-Multi-Claude Collaboration Tool
+Multi-Claude Collaboration Tool (Code With Me Style)
 
 Usage: collab.sh <command> [arguments]
 
@@ -573,11 +1187,40 @@ Instance Management:
   unregister           Unregister and release all locks
   heartbeat            Send heartbeat signal
   status               Show all active instances and locks
+  overview             Show collaboration summary
 
-File Locking:
+=== PLAN SHARING (계획 공유) ===
+  share-plan <title> [desc] [files]   Share your implementation plan
+  view-plans                          View all shared plans
+  comment-plan <id> <comment>         Comment on a plan
+  approve-plan <id>                   Approve a plan
+  start-plan <id>                     Start implementing a plan
+  complete-plan <id>                  Mark plan as completed
+
+=== LIVE EDITING (실시간 수정 공유) ===
+  share-edit <file> <type> <desc>     Share what you're editing
+  view-edits                          View all active edits
+  finish-edit <file>                  Mark edit as finished
+  (types: add, modify, delete, refactor)
+
+=== COLLABORATIVE THINKING (협업적 사고) ===
+  propose <type> <title> [details]    Submit a proposal
+  view-proposals                      View all proposals
+  vote <id> <agree|disagree>          Vote on a proposal
+  respond <id> <response>             Respond to a proposal
+  (types: approach, alternative, optimization, question)
+
+=== DISCUSSIONS (토론) ===
+  discuss <topic> [message]           Start a discussion
+  view-discussions                    View active discussions
+  reply <id> <message>                Reply to a discussion
+  resolve-discussion <id> [resolution] Resolve a discussion
+
+=== LEGACY FILE LOCKING (레거시 파일 잠금) ===
   lock <file>          Acquire lock on a file
   unlock <file>        Release lock on a file
   check-lock <file>    Check lock status of a file
+  (Note: Prefer share-edit for collaborative workflow)
 
 Messaging:
   send <id> <msg>      Send message to another Claude
@@ -609,11 +1252,21 @@ Debug Sessions:
 Environment Variables:
   CLAUDE_ID            Override auto-generated instance ID
 
+=== RECOMMENDED WORKFLOW ===
+1. Register: ./scripts/collab.sh register "My task"
+2. Share plan: ./scripts/collab.sh share-plan "Feature X" "Description" "file.ts"
+3. Wait for feedback: ./scripts/collab.sh view-plans
+4. Start work: ./scripts/collab.sh start-plan <plan_id>
+5. Share edits: ./scripts/collab.sh share-edit src/file.ts modify "Adding new function"
+6. If stuck, discuss: ./scripts/collab.sh propose question "How should we handle X?"
+7. Finish: ./scripts/collab.sh finish-edit src/file.ts && ./scripts/collab.sh complete-plan <id>
+
 Examples:
   ./scripts/collab.sh register "Implementing login feature"
-  ./scripts/collab.sh lock src/auth/login.ts
-  ./scripts/collab.sh send claude-abc "Need help with API"
-  ./scripts/collab.sh sync
+  ./scripts/collab.sh share-plan "Add auth API" "JWT-based authentication" "src/api/auth.ts"
+  ./scripts/collab.sh share-edit src/api/auth.ts add "Adding login endpoint"
+  ./scripts/collab.sh propose approach "Use bcrypt for password hashing"
+  ./scripts/collab.sh discuss "API response format" "Should we use JSON:API spec?"
 EOF
 }
 
@@ -625,26 +1278,64 @@ EOF
 init_dirs
 
 case "${1:-help}" in
+    # Instance management
     register)       cmd_register "$2" ;;
     unregister)     cmd_unregister ;;
     heartbeat)      cmd_heartbeat ;;
     status)         cmd_status ;;
+    overview)       cmd_overview ;;
+
+    # Plan sharing (협업 기반)
+    share-plan)     cmd_share_plan "$2" "$3" "$4" ;;
+    view-plans)     cmd_view_plans ;;
+    comment-plan)   cmd_comment_plan "$2" "$3" ;;
+    approve-plan)   cmd_approve_plan "$2" ;;
+    start-plan)     cmd_start_plan "$2" ;;
+    complete-plan)  cmd_complete_plan "$2" ;;
+
+    # Live editing (실시간 수정 공유)
+    share-edit)     cmd_share_edit "$2" "$3" "$4" ;;
+    view-edits)     cmd_view_edits ;;
+    finish-edit)    cmd_finish_edit "$2" ;;
+
+    # Collaborative thinking (협업적 사고)
+    propose)        cmd_propose "$2" "$3" "$4" ;;
+    view-proposals) cmd_view_proposals ;;
+    vote)           cmd_vote "$2" "$3" ;;
+    respond)        cmd_respond "$2" "$3" ;;
+
+    # Discussions (토론)
+    discuss)        cmd_discuss "$2" "$3" ;;
+    view-discussions) cmd_view_discussions ;;
+    reply)          cmd_reply "$2" "$3" ;;
+    resolve-discussion) cmd_resolve_discussion "$2" "$3" ;;
+
+    # Legacy file locking (레거시)
     lock)           cmd_lock "$2" ;;
     unlock)         cmd_unlock "$2" ;;
     check-lock)     cmd_check_lock "$2" ;;
+
+    # Messaging
     send)           cmd_send "$2" "$3" ;;
     broadcast)      cmd_broadcast "$2" ;;
     inbox)          cmd_inbox ;;
     clear-inbox)    cmd_clear_inbox ;;
+
+    # Status
     update-status)  cmd_update_status "$2" ;;
     complete)       cmd_complete "$2" ;;
     sync)           cmd_sync ;;
     report-error)   cmd_report_error "$2" "$3" ;;
+
+    # Resource slots
     request-test-slot)    cmd_request_test_slot ;;
     release-test-slot)    cmd_release_test_slot ;;
     request-build-slot)   cmd_request_build_slot ;;
     release-build-slot)   cmd_release_build_slot ;;
+
+    # Debug sessions
     debug-session)  cmd_debug_session "$2" "$3" ;;
+
     help|--help|-h) cmd_help ;;
     *)              log_error "Unknown command: $1"; cmd_help; exit 1 ;;
 esac
